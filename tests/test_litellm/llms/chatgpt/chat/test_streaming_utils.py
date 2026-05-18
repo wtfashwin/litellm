@@ -201,3 +201,74 @@ class TestChatGPTToolCallNormalizer:
 
         normalizer = ChatGPTToolCallNormalizer(FakeStream())
         assert normalizer.custom_attr == "test_value"
+
+
+def _make_finish_chunk(finish_reason):
+    """Build a terminal-only chunk: empty delta, populated finish_reason."""
+    delta = Delta(content=None, role=None, tool_calls=None)
+    choice = StreamingChoices(delta=delta, index=0, finish_reason=finish_reason)
+    return ModelResponseStream(choices=[choice])
+
+
+class TestChatGPTToolCallFinishReasonFlip:
+    """
+    Regression for #27144 (second bug).
+
+    The ChatGPT backend API can terminate a tool-calling stream with
+    finish_reason="stop", which causes downstream consumers (OpenAI SDK,
+    `stream_chunk_builder`, etc.) to miss the tool_call dispatch signal.
+    Once the normalizer has observed any tool_call in the stream, a trailing
+    "stop" must be upgraded to "tool_calls" — any other terminator must be
+    left alone so truncation / safety signals still reach the caller.
+    """
+
+    def test_finish_reason_flipped_after_tool_calls_seen(self):
+        chunks = [
+            _make_chunk(tool_calls=[_make_tc(index=0, id="call_1", name="simple_add")]),
+            _make_chunk(tool_calls=[_make_tc(index=0, arguments='{"a":5}')]),
+            _make_finish_chunk("stop"),
+        ]
+        results = list(ChatGPTToolCallNormalizer(iter(chunks)))
+
+        assert results[-1].choices[0].finish_reason == "tool_calls"
+
+    def test_finish_reason_stop_preserved_when_no_tool_calls(self):
+        """Text-only stream → no flip."""
+        chunks = [
+            _make_chunk(content="hello"),
+            _make_finish_chunk("stop"),
+        ]
+        results = list(ChatGPTToolCallNormalizer(iter(chunks)))
+
+        assert results[-1].choices[0].finish_reason == "stop"
+
+    def test_finish_reason_length_preserved_after_tool_calls(self):
+        """A length cap during tool calls must still surface as 'length', not 'tool_calls'."""
+        chunks = [
+            _make_chunk(tool_calls=[_make_tc(index=0, id="call_1", name="simple_add")]),
+            _make_finish_chunk("length"),
+        ]
+        results = list(ChatGPTToolCallNormalizer(iter(chunks)))
+
+        assert results[-1].choices[0].finish_reason == "length"
+
+    def test_finish_reason_content_filter_preserved_after_tool_calls(self):
+        chunks = [
+            _make_chunk(tool_calls=[_make_tc(index=0, id="call_1", name="simple_add")]),
+            _make_finish_chunk("content_filter"),
+        ]
+        results = list(ChatGPTToolCallNormalizer(iter(chunks)))
+
+        assert results[-1].choices[0].finish_reason == "content_filter"
+
+    def test_finish_reason_none_preserved(self):
+        """Intermediate chunks with finish_reason=None must not get flipped."""
+        chunks = [
+            _make_chunk(tool_calls=[_make_tc(index=0, id="call_1", name="simple_add")]),
+            _make_chunk(tool_calls=[_make_tc(index=0, arguments='{"a":5}')]),
+        ]
+        results = list(ChatGPTToolCallNormalizer(iter(chunks)))
+
+        # No flip on intermediate chunks
+        for r in results:
+            assert r.choices[0].finish_reason is None

@@ -2481,3 +2481,202 @@ def test_reasoning_items_streaming_emitted_on_response_completed():
         ri["encrypted_content"] == encrypted
     ), "encrypted_content must be preserved in streaming"
     assert ri["summary"][0]["text"] == summary_text
+
+
+# =============================================================================
+# response.function_call_arguments.done — Spark-style flow (#27144)
+# =============================================================================
+
+
+class TestFunctionCallArgumentsDoneFallback:
+    """
+    Regression coverage for #27144.
+
+    The ChatGPT/Codex Spark variant ships function-call arguments only on
+    `response.function_call_arguments.done` — never on `.delta`. Before the
+    fix the iterator dropped those args silently (falling through to the
+    unhandled-event branch), leaving downstream tools with `arguments='{}'`.
+
+    The chunk_parser now tracks which output_index values streamed deltas,
+    so the `.done` handler only emits args when no delta covered them — the
+    normal Codex `delta -> ... -> done` flow stays single-shot.
+    """
+
+    def _new_iterator(self):
+        from litellm.completion_extras.litellm_responses_transformation.transformation import (
+            OpenAiResponsesToChatCompletionStreamIterator,
+        )
+
+        return OpenAiResponsesToChatCompletionStreamIterator(
+            streaming_response=None, sync_stream=True
+        )
+
+    def test_done_without_deltas_emits_arguments(self):
+        """Spark flow: only .done arrives → args must be emitted by chunk_parser."""
+        iterator = self._new_iterator()
+
+        iterator.chunk_parser(
+            {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_spark",
+                    "name": "simple_add",
+                    "arguments": "",
+                },
+            }
+        )
+        result = iterator.chunk_parser(
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 1,
+                "arguments": '{"a":5,"b":7}',
+            }
+        )
+
+        assert result.choices[0].delta.tool_calls is not None
+        tc = result.choices[0].delta.tool_calls[0]
+        assert tc.index == 1
+        assert tc.function["arguments"] == '{"a":5,"b":7}'
+        assert tc.id is None  # delta — id was already sent on output_item.added
+
+    def test_done_after_deltas_does_not_double_emit(self):
+        """Normal flow: delta + delta + done → .done must not re-emit args."""
+        iterator = self._new_iterator()
+
+        emitted = []
+        for delta in (
+            {
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": '{"a":',
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "5}",
+            },
+        ):
+            r = iterator.chunk_parser(delta)
+            if r.choices[0].delta.tool_calls:
+                emitted.append(r.choices[0].delta.tool_calls[0].function["arguments"])
+
+        done_result = iterator.chunk_parser(
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": '{"a":5}',
+            }
+        )
+
+        assert (
+            done_result.choices[0].delta.tool_calls is None
+        ), "args were already streamed via deltas; .done must not re-emit"
+        assert "".join(emitted) == '{"a":5}'
+
+    def test_done_only_emits_for_unstreamed_output_index(self):
+        """Mixed: index 0 has deltas (silent .done), index 1 has only .done (emit)."""
+        iterator = self._new_iterator()
+
+        iterator.chunk_parser(
+            {
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{}",
+            }
+        )
+        done_idx_0 = iterator.chunk_parser(
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": "{}",
+            }
+        )
+        assert done_idx_0.choices[0].delta.tool_calls is None
+
+        done_idx_1 = iterator.chunk_parser(
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 1,
+                "arguments": '{"x":1}',
+            }
+        )
+        tc = done_idx_1.choices[0].delta.tool_calls[0]
+        assert tc.index == 1
+        assert tc.function["arguments"] == '{"x":1}'
+
+    def test_state_is_per_iterator(self):
+        """Two iterators must not share delta-tracking state."""
+        a = self._new_iterator()
+        b = self._new_iterator()
+
+        a.chunk_parser(
+            {
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{}",
+            }
+        )
+        # b never saw a delta for index 0 → its .done must still emit
+        b_done = b.chunk_parser(
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": '{"q":1}',
+            }
+        )
+        assert b_done.choices[0].delta.tool_calls is not None
+        assert b_done.choices[0].delta.tool_calls[0].function["arguments"] == '{"q":1}'
+
+    def test_done_with_missing_output_index_defaults_to_zero(self):
+        """`.done` without an `output_index` field must still emit at index 0."""
+        iterator = self._new_iterator()
+
+        result = iterator.chunk_parser(
+            {
+                "type": "response.function_call_arguments.done",
+                "arguments": '{"x":1}',
+            }
+        )
+
+        tc = result.choices[0].delta.tool_calls[0]
+        assert tc.index == 0
+        assert tc.function["arguments"] == '{"x":1}'
+
+    def test_done_with_empty_arguments_emits_empty_string(self):
+        """An empty `.done` payload still emits (downstream sees args='', not args=None)."""
+        iterator = self._new_iterator()
+
+        result = iterator.chunk_parser(
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": "",
+            }
+        )
+
+        tc = result.choices[0].delta.tool_calls[0]
+        assert tc.function["arguments"] == ""
+
+    def test_enum_event_type_for_delta_is_tracked(self):
+        """`.delta` arriving as an enum value must still register for dedup."""
+        from litellm.types.llms.openai import ResponsesAPIStreamEvents
+
+        iterator = self._new_iterator()
+
+        iterator.chunk_parser(
+            {
+                "type": ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA,
+                "output_index": 2,
+                "delta": '{"q":',
+            }
+        )
+        done_result = iterator.chunk_parser(
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 2,
+                "arguments": '{"q":1}',
+            }
+        )
+        assert done_result.choices[0].delta.tool_calls is None

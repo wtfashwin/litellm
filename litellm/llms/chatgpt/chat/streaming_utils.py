@@ -56,6 +56,15 @@ class ChatGPTToolCallNormalizer:
         if not chunk.choices:
             return chunk
 
+        # The ChatGPT backend can terminate a tool-calling stream with
+        # finish_reason="stop" instead of "tool_calls", so SDK consumers
+        # that key off the terminal finish_reason miss the tool dispatch.
+        # If we have already observed any tool_call in this stream, upgrade
+        # a trailing "stop" to "tool_calls" — leave any other terminator
+        # (length, content_filter, ...) alone so truncation signals survive.
+        if self._seen_ids and chunk.choices[0].finish_reason == "stop":
+            chunk.choices[0].finish_reason = "tool_calls"
+
         delta = chunk.choices[0].delta
         if delta is None or not delta.tool_calls:
             return chunk

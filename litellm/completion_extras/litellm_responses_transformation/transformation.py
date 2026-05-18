@@ -15,6 +15,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Set,
     Tuple,
     Union,
     cast,
@@ -1085,6 +1086,13 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         self, streaming_response, sync_stream: bool, json_mode: Optional[bool] = False
     ):
         super().__init__(streaming_response, sync_stream, json_mode)
+        # Per-stream record of which `output_index` values have already emitted
+        # `response.function_call_arguments.delta` events.  Used by
+        # `chunk_parser` to decide whether the matching
+        # `response.function_call_arguments.done` should also emit the args
+        # (when no delta carried them — e.g. ChatGPT/Codex Spark, #27144) or
+        # stay silent (normal flow where deltas already streamed them).
+        self._arg_delta_output_indices: Set[int] = set()
 
     def _handle_string_chunk(
         self, str_line: Union[str, "BaseModel"]
@@ -1399,15 +1407,61 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         """
         Parse a Responses API streaming chunk and convert to OpenAI format.
 
+        Tracks which `output_index` values have already received argument
+        deltas, then promotes `response.function_call_arguments.done` into a
+        tool_call delta when no preceding deltas covered that index — fixes
+        the ChatGPT/Codex Spark flow where args are shipped only on `.done`
+        (#27144) without double-emitting when normal deltas were present.
+
         Args:
             chunk: Dict containing the Responses API event chunk
 
         Returns:
             ModelResponseStream: OpenAI-formatted streaming chunk
         """
+        from litellm.types.llms.openai import ChatCompletionToolCallFunctionChunk
+        from litellm.types.utils import (
+            ChatCompletionToolCallChunk,
+            Delta,
+            ModelResponseStream,
+            StreamingChoices,
+        )
+
         verbose_logger.debug(
             f"Chat provider: transform_streaming_response called with chunk: {chunk}"
         )
+
+        event_type = chunk.get("type")
+        if isinstance(event_type, ResponsesAPIStreamEvents):
+            event_type = event_type.value
+
+        if event_type == "response.function_call_arguments.delta":
+            self._arg_delta_output_indices.add(chunk.get("output_index", 0))
+        elif event_type == "response.function_call_arguments.done":
+            output_index = chunk.get("output_index", 0)
+            if output_index not in self._arg_delta_output_indices:
+                arguments = chunk.get("arguments") or ""
+                return ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            index=0,
+                            delta=Delta(
+                                tool_calls=[
+                                    ChatCompletionToolCallChunk(
+                                        id=None,
+                                        index=output_index,
+                                        type="function",
+                                        function=ChatCompletionToolCallFunctionChunk(
+                                            name=None, arguments=arguments
+                                        ),
+                                    )
+                                ]
+                            ),
+                            finish_reason=None,
+                        )
+                    ]
+                )
+
         return OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream(
             chunk
         )
